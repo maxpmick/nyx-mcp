@@ -11,7 +11,7 @@ import { registerReadingTools } from "./tools/reading.js";
 import { registerCommandLogTools } from "./tools/commandLog.js";
 import { registerIngestTools } from "./tools/ingest.js";
 
-export async function startMcpServer(): Promise<void> {
+export function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "nyx-memory",
     version: "1.0.0",
@@ -28,6 +28,11 @@ export async function startMcpServer(): Promise<void> {
   registerCommandLogTools(server);
   registerIngestTools(server);
 
+  return server;
+}
+
+export async function startMcpServer(): Promise<void> {
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

@@ -23,6 +23,9 @@ import { masscanParser } from "../parsers/masscan.js";
 import { gobusterParser } from "../parsers/gobuster.js";
 import { niktoParser } from "../parsers/nikto.js";
 import { ingestToolOutput } from "../tools/ingest.js";
+import { createMcpServer } from "../serve.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 describe("nyx-memory integration", () => {
   let engagementId: string;
@@ -588,5 +591,370 @@ describe("parsers", () => {
     assert.equal(result.findings[0].severity, "info");
     assert.equal(result.findings[0].status, "potential");
     assert.ok(result.findings[0].vulnerability.startsWith("nikto:"));
+  });
+});
+
+// ── MCP server protocol tests ──
+
+describe("MCP server", () => {
+  let client: Client;
+  let serverTransport: InMemoryTransport;
+  let clientTransport: InMemoryTransport;
+
+  // Helper to call a tool and parse the JSON text response
+  async function call(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    const result = await client.callTool({ name, arguments: args });
+    const content = result.content as Array<{ type: string; text: string }>;
+    assert.ok(content.length > 0, `Tool ${name} returned no content`);
+    assert.equal(content[0].type, "text");
+    return JSON.parse(content[0].text);
+  }
+
+  before(async () => {
+    const server = createMcpServer();
+    [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+
+    client = new Client({ name: "test-client", version: "1.0.0" });
+    await client.connect(clientTransport);
+  });
+
+  after(async () => {
+    await clientTransport.close();
+    await serverTransport.close();
+  });
+
+  // ── Server initialization ──
+
+  it("reports server info on connect", () => {
+    const info = client.getServerVersion();
+    assert.ok(info);
+    assert.equal(info!.name, "nyx-memory");
+    assert.equal(info!.version, "1.0.0");
+  });
+
+  it("lists all 19 tools", async () => {
+    const result = await client.listTools();
+    const names = result.tools.map((t) => t.name).sort();
+    assert.equal(names.length, 19);
+
+    const expected = [
+      "attack_path_update",
+      "command_log",
+      "credential_add",
+      "dead_end_log",
+      "engagement_close",
+      "engagement_create",
+      "engagement_list",
+      "engagement_resume",
+      "engagement_status",
+      "evidence_save",
+      "executive_summary_update",
+      "finding_add",
+      "finding_update",
+      "host_discover",
+      "host_update",
+      "ingest_tool_output",
+      "notes_read",
+      "todo_add",
+      "todo_complete",
+    ];
+    assert.deepEqual(names, expected);
+  });
+
+  it("each tool has a description and input schema", async () => {
+    const result = await client.listTools();
+    for (const tool of result.tools) {
+      assert.ok(tool.description, `${tool.name} missing description`);
+      assert.ok(tool.inputSchema, `${tool.name} missing inputSchema`);
+      assert.equal(tool.inputSchema.type, "object");
+    }
+  });
+
+  // ── Full engagement lifecycle over MCP protocol ──
+
+  it("creates an engagement via MCP", async () => {
+    const data = await call("engagement_create", {
+      target: "MCP Test Corp",
+      scope: ["10.10.0.0/24"],
+      rules_of_engagement: "Test only",
+    });
+    assert.ok((data as { id: string }).id);
+    assert.equal(data.target, "MCP Test Corp");
+    assert.equal(data.status, "active");
+  });
+
+  it("lists engagements via MCP", async () => {
+    const data = await call("engagement_list");
+    const entries = data as unknown as Array<{ target: string; is_current: boolean }>;
+    assert.ok(entries.length >= 1);
+    const mcpEntry = entries.find((e) => e.target === "MCP Test Corp");
+    assert.ok(mcpEntry);
+    assert.equal(mcpEntry!.is_current, true);
+  });
+
+  it("gets engagement status via MCP", async () => {
+    const data = await call("engagement_status");
+    assert.equal(data.target, "MCP Test Corp");
+    assert.equal(data.host_count, 0);
+  });
+
+  it("discovers a host via MCP", async () => {
+    const data = await call("host_discover", {
+      ip: "10.10.0.1",
+      hostname: "mcp-host.local",
+      os: "Ubuntu 22.04",
+      services: [
+        { port: 22, proto: "tcp", service: "ssh", version: "OpenSSH 9.1" },
+        { port: 80, proto: "tcp", service: "http", version: "Apache 2.4" },
+      ],
+    });
+    assert.equal(data.ip, "10.10.0.1");
+    assert.equal(data.hostname, "mcp-host.local");
+    const services = data.services as Array<{ port: number }>;
+    assert.equal(services.length, 2);
+  });
+
+  it("updates a host section via MCP", async () => {
+    const data = await call("host_update", {
+      ip: "10.10.0.1",
+      section: "enumeration",
+      content: "### Gobuster\n\n- /admin (403)\n- /api (200)",
+    });
+    assert.ok((data as { enumeration: string }).enumeration.includes("/admin"));
+  });
+
+  it("adds a finding via MCP", async () => {
+    const data = await call("finding_add", {
+      host: "10.10.0.1",
+      vulnerability: "RCE via deserialization",
+      severity: "critical",
+      cvss: 9.8,
+      notes: "Java deserialization in /api/import",
+    });
+    assert.ok((data as { id: string }).id);
+    assert.equal(data.severity, "critical");
+  });
+
+  it("updates a finding via MCP", async () => {
+    const data = await call("finding_update", {
+      id: "F-001",
+      status: "exploited",
+      notes: "Got reverse shell",
+    });
+    assert.equal(data.status, "exploited");
+    assert.ok((data as { notes: string }).notes.includes("reverse shell"));
+  });
+
+  it("returns isError for invalid finding update", async () => {
+    const result = await client.callTool({
+      name: "finding_update",
+      arguments: { id: "F-999", notes: "nope" },
+    });
+    assert.equal(result.isError, true);
+  });
+
+  it("adds a credential via MCP", async () => {
+    const data = await call("credential_add", {
+      source: "10.10.0.1 /etc/shadow",
+      username: "root",
+      password_or_hash: "$6$rounds=...",
+      cred_type: "hash",
+      access_level: "root",
+      verified: false,
+    });
+    assert.ok((data as { id: string }).id);
+    assert.equal(data.username, "root");
+  });
+
+  it("saves evidence via MCP", async () => {
+    const data = await call("evidence_save", {
+      filename: "rce-proof.txt",
+      content: "uid=0(root) gid=0(root)",
+      description: "RCE proof",
+    });
+    assert.equal(data.overwritten, false);
+  });
+
+  it("logs a command via MCP", async () => {
+    const data = await call("command_log", {
+      command: "nmap -sV 10.10.0.1",
+      target: "10.10.0.1",
+      exit_code: 0,
+      source: "mcp",
+    });
+    assert.ok((data as { id: string }).id);
+    assert.equal(data.tool, "nmap");
+  });
+
+  it("updates attack path via MCP", async () => {
+    const data = await call("attack_path_update", {
+      description: "Discovered deserialization RCE on 10.10.0.1",
+    });
+    assert.equal(data.step, 1);
+  });
+
+  it("updates executive summary via MCP", async () => {
+    const data = await call("executive_summary_update", {
+      summary: "Critical RCE found on primary web server.",
+    });
+    assert.ok((data as { summary: string }).summary.includes("Critical RCE"));
+  });
+
+  it("logs a dead end via MCP", async () => {
+    const data = await call("dead_end_log", {
+      technique: "Brute force SSH",
+      target: "10.10.0.1",
+      reason: "Fail2ban active, rate-limited",
+    });
+    assert.ok(data.timestamp);
+  });
+
+  it("adds and completes a TODO via MCP", async () => {
+    const todo = await call("todo_add", {
+      description: "Pivot to 10.10.0.2",
+      priority: "high",
+    });
+    assert.ok((todo as { id: string }).id);
+    assert.equal(todo.status, "pending");
+
+    const done = await call("todo_complete", { id: (todo as { id: string }).id });
+    assert.equal(done.status, "completed");
+  });
+
+  // ── Reading via MCP ──
+
+  it("reads findings via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "findings" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("RCE via deserialization"));
+  });
+
+  it("reads a host via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "host", host_ip: "10.10.0.1" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("10.10.0.1"));
+    assert.ok(text.includes("OpenSSH"));
+  });
+
+  it("searches via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "search", query: "deserialization" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("F-001"));
+  });
+
+  it("reads credentials via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "credentials" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("root"));
+  });
+
+  it("reads attack path via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "attack_path" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("deserialization"));
+  });
+
+  it("reads command log via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "command_log" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("nmap"));
+  });
+
+  it("reads TODOs via MCP", async () => {
+    const result = await client.callTool({
+      name: "notes_read",
+      arguments: { what: "todos" },
+    });
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes("Pivot"));
+  });
+
+  // ── Ingest via MCP ──
+
+  it("ingests nmap output via MCP", async () => {
+    const nmapXml = `<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="10.10.0.50" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="3306">
+        <state state="open"/>
+        <service name="mysql" product="MySQL" version="8.0"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>`;
+
+    const fixturePath = path.join(TEST_DIR, "mcp-nmap-fixture.xml");
+    await fs.writeFile(fixturePath, nmapXml, "utf-8");
+
+    const data = await call("ingest_tool_output", {
+      tool: "nmap",
+      file: fixturePath,
+    });
+    assert.equal(data.hosts_discovered, 1);
+    assert.equal(data.services_added, 1);
+    assert.equal(data.evidence_saved, true);
+  });
+
+  it("returns isError for unsupported tool via MCP", async () => {
+    const result = await client.callTool({
+      name: "ingest_tool_output",
+      arguments: { tool: "burpsuite", file: "/tmp/fake.xml" },
+    });
+    assert.equal(result.isError, true);
+  });
+
+  // ── Close + resume via MCP ──
+
+  it("closes engagement via MCP", async () => {
+    const data = await call("engagement_close", {
+      status: "completed",
+      executive_summary: "MCP test complete.",
+    });
+    assert.equal(data.status, "completed");
+  });
+
+  it("returns isError for status without active engagement", async () => {
+    const result = await client.callTool({
+      name: "engagement_status",
+      arguments: {},
+    });
+    assert.equal(result.isError, true);
+  });
+
+  it("resumes engagement via MCP", async () => {
+    // Get the engagement ID from the list
+    const listResult = await client.callTool({
+      name: "engagement_list",
+      arguments: {},
+    });
+    const entries = JSON.parse(
+      (listResult.content as Array<{ text: string }>)[0].text
+    ) as Array<{ id: string; target: string }>;
+    const mcpEng = entries.find((e) => e.target === "MCP Test Corp");
+    assert.ok(mcpEng);
+
+    const data = await call("engagement_resume", { id: mcpEng!.id });
+    assert.ok((data as { metadata: { target: string } }).metadata.target === "MCP Test Corp");
   });
 });

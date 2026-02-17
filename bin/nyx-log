@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# nyx-log — transparent command wrapper that logs output to nyx-memory
+#
+# Usage: nyx-log <command> [args...]
+#
+# Runs the given command normally (same stdout/stderr/exit code),
+# while capturing output and logging it to the active engagement.
+
+set -euo pipefail
+
+# ── Resolve nyx-memory binary ──
+NYX_MEMORY="${NYX_MEMORY:-nyx-memory}"
+
+# ── Check for active engagement ──
+if ! "$NYX_MEMORY" status --quiet 2>/dev/null; then
+  echo "[nyx-log] No active engagement — running command without logging." >&2
+  exec "$@"
+fi
+
+if [ $# -eq 0 ]; then
+  echo "Usage: nyx-log <command> [args...]" >&2
+  exit 1
+fi
+
+# ── Setup ──
+TMPFILE=$(mktemp /tmp/nyx-log.XXXXXX)
+trap 'rm -f "$TMPFILE"' EXIT
+
+# Auto-detect tool name from first argument
+TOOL=$(basename "$1")
+COMMAND="$*"
+
+# Auto-detect target: find the last argument that looks like an IP, hostname, or URL
+TARGET=""
+for arg in "$@"; do
+  # IPv4
+  if [[ "$arg" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+    TARGET="$arg"
+  # URL
+  elif [[ "$arg" =~ ^https?:// ]]; then
+    TARGET="$arg"
+  # Hostname-like (contains a dot, no flags)
+  elif [[ "$arg" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    TARGET="$arg"
+  fi
+done
+
+# ── Record start time ──
+STARTED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+START_EPOCH=$(date +%s)
+
+# ── Run command with tee ──
+set +e
+"$@" 2>&1 | tee "$TMPFILE"
+EXIT_CODE=${PIPESTATUS[0]}
+set -e
+
+# ── Record end time ──
+FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+END_EPOCH=$(date +%s)
+DURATION=$((END_EPOCH - START_EPOCH))
+
+# ── Log to nyx-memory ──
+FILENAME="${TOOL}-$(date +%s).log"
+
+LOG_ARGS=(
+  --tool "$TOOL"
+  --command "$COMMAND"
+  --started-at "$STARTED_AT"
+  --duration "$DURATION"
+  --exit-code "$EXIT_CODE"
+  --filename "$FILENAME"
+)
+
+if [ -n "$TARGET" ]; then
+  LOG_ARGS+=(--target "$TARGET")
+fi
+
+# Pipe captured output to nyx-memory log (fail-safe)
+if ! cat "$TMPFILE" | "$NYX_MEMORY" log "${LOG_ARGS[@]}" 2>/dev/null; then
+  echo "[nyx-log] Warning: failed to log output to nyx-memory" >&2
+fi
+
+# ── Detect structured output files and auto-ingest ──
+# Check for nmap -oX, masscan -oX/-oJ output files
+INGEST_FILE=""
+INGEST_TOOL=""
+
+case "$TOOL" in
+  nmap)
+    # Look for -oX flag and its argument
+    PREV=""
+    for arg in "$@"; do
+      if [ "$PREV" = "-oX" ]; then
+        INGEST_FILE="$arg"
+        INGEST_TOOL="nmap"
+        break
+      fi
+      PREV="$arg"
+    done
+    ;;
+  masscan)
+    PREV=""
+    for arg in "$@"; do
+      if [ "$PREV" = "-oX" ] || [ "$PREV" = "-oJ" ]; then
+        INGEST_FILE="$arg"
+        INGEST_TOOL="masscan"
+        break
+      fi
+      PREV="$arg"
+    done
+    ;;
+esac
+
+if [ -n "$INGEST_FILE" ] && [ -f "$INGEST_FILE" ]; then
+  INGEST_ARGS=(--tool "$INGEST_TOOL" --file "$INGEST_FILE")
+  if [ -n "$TARGET" ]; then
+    INGEST_ARGS+=(--target "$TARGET")
+  fi
+  if ! "$NYX_MEMORY" ingest "${INGEST_ARGS[@]}" 2>/dev/null; then
+    echo "[nyx-log] Warning: failed to auto-ingest $INGEST_FILE" >&2
+  fi
+fi
+
+exit $EXIT_CODE

@@ -1,0 +1,49 @@
+{
+  "name": "nyx-memory",
+  "version": "1.0.0",
+  "description": "Structured pentest engagement memory for the Nyx autonomous agent",
+  "type": "module",
+  "main": "dist/cli.js",
+  "bin": {
+    "nyx-memory": "dist/cli.js",
+    "nyx-log": "bin/nyx-log"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js serve",
+    "test": "node --test dist/test/integration.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxpmick/nyx-mcp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "pentest",
+    "security",
+    "nyx",
+    "engagement"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "commander": "^13.1.0",
+    "fast-xml-parser": "^5.2.3",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.8.3"
+  }
+}

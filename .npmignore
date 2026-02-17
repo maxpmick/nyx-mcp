@@ -1,0 +1,6 @@
+src/
+*.test.js
+*.test.d.ts
+*.test.js.map
+tsconfig.json
+.claude/
